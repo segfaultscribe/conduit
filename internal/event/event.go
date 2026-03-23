@@ -22,6 +22,7 @@ type ChangeEvent struct {
 	After     map[string]any
 	LSN       pglogrepl.LSN
 	Timestamp time.Time
+	Data      map[string]string
 }
 
 type Operation string
@@ -37,6 +38,7 @@ func NewChangeEvent(
 	schema,
 	table string,
 	lsn pglogrepl.LSN,
+	data map[string]string,
 ) *ChangeEvent {
 	return &ChangeEvent{
 		Operation: op,
@@ -44,5 +46,6 @@ func NewChangeEvent(
 		Table:     table,
 		LSN:       lsn,
 		Timestamp: time.Now().UTC(),
+		Data:      data,
 	}
 }
