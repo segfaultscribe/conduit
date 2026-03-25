@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
-	gde "github.com/joho/godotenv"
 	"github.com/segfaultscribe/conduit/internal/checkpoint"
 	"github.com/segfaultscribe/conduit/internal/event"
 )
@@ -38,24 +36,35 @@ func New(
 
 // start method reconnection loop
 
-// func (c *Consumer) Start(ctx context.Context) error {
-// 	for {
-// 		err :=
-// 	}
-// }
+func (c *Consumer) Start(ctx context.Context) error {
+	for {
+		err := c.run(ctx)
+		// When run returns because the context
+		// was cancelled, it returns 'context.Canceled' as the error.
+		// 'ctx.Err()' returns non-nil the moment context id done
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		if err != nil {
+			log.Printf("consumer error: %v - reconecting in 5s", err)
+			// conc pattern to make sure time.After doesn't mess up safe shutdown
+			select {
+			case <-time.After(5 * time.Second):
+				// need to reset relations before trying again
+				c.relations = make(map[uint32]*pglogrepl.RelationMessage)
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	}
+}
 
 func (c *Consumer) run(ctx context.Context) error {
-	// CONNECT AND START REPLICATION
-	err := gde.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-	// get the database URL from the environment file
-	dbURL := os.Getenv("DB_URL")
 
-	conn, err := pgconn.Connect(ctx, dbURL)
+	conn, err := pgconn.Connect(ctx, c.connStr)
 	if err != nil {
-		log.Fatal("failed to connect to the DATABASE: ", err)
+		return fmt.Errorf("failed to connect to the DATABASE: %w", err)
 	}
 
 	defer conn.Close(ctx)
@@ -68,7 +77,7 @@ func (c *Consumer) run(ctx context.Context) error {
 	lsn, err := c.checkpointer.Read()
 
 	if err != nil {
-		return fmt.Errorf("cannot read LSN!")
+		return fmt.Errorf("cannot read LSN: %w", err)
 	}
 
 	err = pglogrepl.StartReplication(
@@ -81,7 +90,7 @@ func (c *Consumer) run(ctx context.Context) error {
 		},
 	)
 	if err != nil {
-		log.Fatal("failed to start replication:", err)
+		return fmt.Errorf("failed to start replication: %w", err)
 	}
 	log.Println("Replication started. Waiting for changes...")
 
@@ -102,10 +111,12 @@ func (c *Consumer) run(ctx context.Context) error {
 				conn,
 				pglogrepl.StandbyStatusUpdate{
 					WALWritePosition: pglogrepl.LSN(lsn),
+					WALFlushPosition: pglogrepl.LSN(lsn),
+					WALApplyPosition: pglogrepl.LSN(lsn),
 				},
 			)
 			if err != nil {
-				log.Fatal("failed to send heartbeat:", err)
+				return fmt.Errorf("failed to send heartbeat: %w", err)
 			}
 			nextHeartbeat = time.Now().Add(5 * time.Second)
 		}
@@ -119,7 +130,7 @@ func (c *Consumer) run(ctx context.Context) error {
 				// no messages arrived before deadline
 				continue
 			}
-			log.Fatal("receive error:", err)
+			return fmt.Errorf("receive error: %w", err)
 		}
 
 		msg, ok := rawMsg.(*pgproto3.CopyData)
@@ -132,7 +143,7 @@ func (c *Consumer) run(ctx context.Context) error {
 		case pglogrepl.PrimaryKeepaliveMessageByteID:
 			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
 			if err != nil {
-				log.Fatal("ParsePrimaryKeepaliveMessage failed:", err)
+				return fmt.Errorf("ParsePrimaryKeepaliveMessage failed: %w", err)
 			}
 
 			if pkm.ReplyRequested {
@@ -147,7 +158,7 @@ func (c *Consumer) run(ctx context.Context) error {
 					},
 				)
 				if err != nil {
-					log.Fatal("failed to send immediate heartbeat:", err)
+					return fmt.Errorf("failed to send immediate heartbeat: %w", err)
 				}
 
 				nextHeartbeat = time.Now().Add(5 * time.Second)
@@ -158,14 +169,14 @@ func (c *Consumer) run(ctx context.Context) error {
 			// an actual WAL Content
 			xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
 			if err != nil {
-				log.Fatal("parse error:", err)
+				return fmt.Errorf("parse error: %w", err)
 			}
 
 			pendingLSN := xld.WALStart
 
 			logicalMsg, err := pglogrepl.Parse(xld.WALData)
 			if err != nil {
-				log.Fatal("logical parse error:", err)
+				return fmt.Errorf("logical parse error: %w", err)
 			}
 
 			event := c.decodeToEvent(logicalMsg, pendingLSN)
@@ -174,14 +185,20 @@ func (c *Consumer) run(ctx context.Context) error {
 				if err != nil {
 					return err
 				}
-				c.checkpointer.Write(pendingLSN)
+				if err := c.checkpointer.Write(pendingLSN); err != nil {
+					return fmt.Errorf("failed to write checkpoint: %w", err)
+				}
+				lsn = pendingLSN
 			}
 		}
 	}
 
 }
 
-func (c *Consumer) decodeToEvent(msg pglogrepl.Message, lsn pglogrepl.LSN) *event.ChangeEvent {
+func (c *Consumer) decodeToEvent(
+	msg pglogrepl.Message,
+	lsn pglogrepl.LSN,
+) *event.ChangeEvent {
 	// add decoding stuff
 	switch mgt := msg.(type) {
 	case *pglogrepl.BeginMessage:
@@ -199,13 +216,14 @@ func (c *Consumer) decodeToEvent(msg pglogrepl.Message, lsn pglogrepl.LSN) *even
 			log.Printf("Warning: Received INSERT for unknown relation ID %d", mgt.RelationID)
 			return nil
 		}
-		return event.NewChangeEvent(
+		e := event.NewChangeEvent(
 			event.OperationInsert,
 			rel.Namespace,
 			rel.RelationName,
 			lsn,
-			decodeRow(rel, mgt.Tuple),
 		)
+		e.After = decodeRow(rel, mgt.Tuple)
+		return e
 	case *pglogrepl.UpdateMessage:
 		rel, ok := c.relations[mgt.RelationID]
 		if !ok {
@@ -213,13 +231,17 @@ func (c *Consumer) decodeToEvent(msg pglogrepl.Message, lsn pglogrepl.LSN) *even
 			log.Printf("Warning: Received UPDATE for unknown relation ID %d", mgt.RelationID)
 			return nil
 		}
-		return event.NewChangeEvent(
+		e := event.NewChangeEvent(
 			event.OperationUpdate,
 			rel.Namespace,
 			rel.RelationName,
 			lsn,
-			decodeRow(rel, mgt.NewTuple),
 		)
+		if mgt.OldTuple != nil {
+			e.Before = decodeRow(rel, mgt.OldTuple)
+		}
+		e.After = decodeRow(rel, mgt.NewTuple)
+		return e
 	case *pglogrepl.DeleteMessage:
 		rel, ok := c.relations[mgt.RelationID]
 		if !ok {
@@ -227,19 +249,25 @@ func (c *Consumer) decodeToEvent(msg pglogrepl.Message, lsn pglogrepl.LSN) *even
 			log.Printf("Warning: Received DELETE for unknown relation ID %d", mgt.RelationID)
 			return nil
 		}
-		return event.NewChangeEvent(
+		e := event.NewChangeEvent(
 			event.OperationDelete,
 			rel.Namespace,
 			rel.RelationName,
 			lsn,
-			decodeRow(rel, mgt.OldTuple),
 		)
+		if mgt.OldTuple != nil {
+			e.Before = decodeRow(rel, mgt.OldTuple)
+		}
+		return e
 	}
 	return nil
 }
 
-func decodeRow(rel *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData) map[string]string {
-	result := make(map[string]string)
+func decodeRow(
+	rel *pglogrepl.RelationMessage,
+	tuple *pglogrepl.TupleData,
+) map[string]any {
+	result := make(map[string]any)
 	if tuple == nil {
 		return result
 	}
