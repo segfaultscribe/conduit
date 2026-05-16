@@ -8,7 +8,7 @@ package sink
 import (
 	"context"
 
-	"github.com/segfaultscribe/conduit/internal/event"
+	"github.com/segfaultscribe/conduit/pkg/event"
 )
 
 type Sink interface {
@@ -27,5 +27,5 @@ type Sink interface {
 	// Flush any buffers, close connections cleanly.
 	// For Kafka this means flushing any batched messages that haven't been sent yet.
 	// graceful shutdown
-	Close()
+	Close() error
 }

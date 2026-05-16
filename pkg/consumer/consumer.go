@@ -9,28 +9,49 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
-	"github.com/segfaultscribe/conduit/internal/checkpoint"
-	"github.com/segfaultscribe/conduit/internal/event"
+	"github.com/segfaultscribe/conduit/pkg/checkpoint"
+	"github.com/segfaultscribe/conduit/pkg/event"
+	"github.com/segfaultscribe/conduit/pkg/sink"
 )
 
 type Consumer struct {
 	connStr      string
 	checkpointer *checkpoint.Checkpointer
 	relations    map[uint32]*pglogrepl.RelationMessage
-	eventHandler func(ctx context.Context, event *event.ChangeEvent) error
+	// eventHandler func(ctx context.Context, event *event.ChangeEvent) error
+	sink sink.Sink
 }
 
 // constructor
+// func New(
+// 	connStr string,
+// 	cp *checkpoint.Checkpointer,
+// 	// handler func(ctx context.Context, event *event.ChangeEvent) error,
+// 	s sink.Sink,
+// ) *Consumer {
+// 	return &Consumer{
+// 		connStr:      connStr,
+// 		checkpointer: cp,
+// 		relations:    make(map[uint32]*pglogrepl.RelationMessage),
+// 		// eventHandler: handler,
+// 		sink: s,
+// 	}
+// }
+
 func New(
-	connStr string,
-	cp *checkpoint.Checkpointer,
-	handler func(ctx context.Context, event *event.ChangeEvent) error,
+	dbURL string,
+	checkpointFilePath string,
+	sink sink.Sink,
 ) *Consumer {
+	// ctx := context.Background()
+
+	cp := checkpoint.New(checkpointFilePath)
+
 	return &Consumer{
-		connStr:      connStr,
+		connStr:      dbURL,
 		checkpointer: cp,
 		relations:    make(map[uint32]*pglogrepl.RelationMessage),
-		eventHandler: handler,
+		sink:         sink,
 	}
 }
 
@@ -68,6 +89,10 @@ func (c *Consumer) run(ctx context.Context) error {
 	}
 
 	defer conn.Close(ctx)
+
+	if err := c.sink.Connect(ctx); err != nil {
+		return fmt.Errorf("failed to connect to SINK: %w", err)
+	}
 
 	pluginArgs := []string{
 		"proto_version '1'",
@@ -181,10 +206,11 @@ func (c *Consumer) run(ctx context.Context) error {
 
 			event := c.decodeToEvent(logicalMsg, pendingLSN)
 			if event != nil {
-				err := c.eventHandler(ctx, event)
-				if err != nil {
-					return err
+				// err := c.eventHandler(ctx, event)
+				if err := c.sink.Publish(ctx, event); err != nil {
+					return fmt.Errorf("sink publish failed: %w", err)
 				}
+
 				if err := c.checkpointer.Write(pendingLSN); err != nil {
 					return fmt.Errorf("failed to write checkpoint: %w", err)
 				}
@@ -192,7 +218,6 @@ func (c *Consumer) run(ctx context.Context) error {
 			}
 		}
 	}
-
 }
 
 func (c *Consumer) decodeToEvent(
