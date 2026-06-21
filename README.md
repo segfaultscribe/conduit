@@ -19,7 +19,7 @@ Conduit acts as a managed pipeline between your data source and data destination
 ## Installation
 
 ```bash
-go get [github.com/segfaultscribe/conduit](https://github.com/segfaultscribe/conduit)
+go get github.com/segfaultscribe/conduit
 ```
 
 Conduit allows the user to decide how to export and use the data extracted thorught the capture by using a pluggable sink interface. To connect to the sink, the user must implement the sink interface and pass it to the consumer on creation. The sink can be implemented according to the user's whims.
