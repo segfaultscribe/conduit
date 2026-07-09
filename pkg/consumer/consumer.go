@@ -22,11 +22,6 @@ type Consumer struct {
 	sink sink.Sink
 }
 
-type currentTransaction struct {
-	commitLSN pglogrepl.LSN
-	events    *event.ChangeEvent
-}
-
 // constructor
 // func New(
 // 	connStr string,
@@ -130,7 +125,7 @@ func (c *Consumer) run(ctx context.Context) error {
 	// // from row changes. We store them here and look them up when a row
 	// // change arrives.
 	// relations := map[uint32]*pglogrepl.RelationMessage{}
-
+	txBuffer := make([]*event.ChangeEvent, 0)
 	// main loop
 	for {
 		if time.Now().After(nextHeartbeat) {
@@ -207,17 +202,28 @@ func (c *Consumer) run(ctx context.Context) error {
 				return fmt.Errorf("logical parse error: %w", err)
 			}
 
-			event := c.decodeToEvent(logicalMsg, pendingLSN)
-			if event != nil {
-				// err := c.eventHandler(ctx, event)
-				if err := c.sink.Publish(ctx, event); err != nil {
-					return fmt.Errorf("sink publish failed: %w", err)
+			// event := c.decodeToEvent(logicalMsg, pendingLSN)
+			switch mgt := logicalMsg.(type) {
+			case *pglogrepl.BeginMessage:
+				txBuffer = txBuffer[:0]
+			case *pglogrepl.RelationMessage:
+				c.relations[mgt.RelationID] = mgt
+			case *pglogrepl.InsertMessage, *pglogrepl.UpdateMessage, *pglogrepl.DeleteMessage:
+				e := c.decodeToEvent(logicalMsg, pendingLSN)
+				if e != nil {
+					txBuffer = append(txBuffer, e)
 				}
-
-				if err := c.checkpointer.Write(pendingLSN); err != nil {
-					return fmt.Errorf("failed to write checkpoint: %w", err)
+			case *pglogrepl.CommitMessage:
+				commitLSN := mgt.CommitLSN
+				for _, e := range txBuffer {
+					if err := c.sink.Publish(ctx, e); err != nil {
+						return fmt.Errorf("sink publish failed: %w", err)
+					}
 				}
-				lsn = pendingLSN
+				if err := c.checkpointer.Write(commitLSN); err != nil {
+					return fmt.Errorf("checkpoint write failed: %w", err)
+				}
+				lsn = commitLSN
 			}
 		}
 	}
@@ -229,14 +235,6 @@ func (c *Consumer) decodeToEvent(
 ) *event.ChangeEvent {
 	// add decoding stuff
 	switch mgt := msg.(type) {
-	case *pglogrepl.BeginMessage:
-		return nil
-	case *pglogrepl.CommitMessage:
-		return nil
-	case *pglogrepl.RelationMessage:
-		// what to do?
-		c.relations[mgt.RelationID] = mgt
-		return nil
 	case *pglogrepl.InsertMessage:
 		rel, ok := c.relations[mgt.RelationID]
 		if !ok {
