@@ -67,7 +67,7 @@ func (c *Checkpointer) Write(lsn pglogrepl.LSN) error {
 		return fmt.Errorf("failed to write to temp file: %w", err)
 	}
 
-	// because you should not try to rename an open file
+	// Do not try to rename an open file
 	f.Close()
 
 	err = os.Rename(f.Name(), c.filePath)

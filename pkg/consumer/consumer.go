@@ -22,6 +22,11 @@ type Consumer struct {
 	sink sink.Sink
 }
 
+type currentTransaction struct {
+	commitLSN pglogrepl.LSN
+	events    *event.ChangeEvent
+}
+
 // constructor
 // func New(
 // 	connStr string,
@@ -82,7 +87,6 @@ func (c *Consumer) Start(ctx context.Context) error {
 }
 
 func (c *Consumer) run(ctx context.Context) error {
-
 	conn, err := pgconn.Connect(ctx, c.connStr)
 	if err != nil {
 		return fmt.Errorf("failed to connect to the DATABASE: %w", err)
@@ -100,7 +104,6 @@ func (c *Consumer) run(ctx context.Context) error {
 	}
 
 	lsn, err := c.checkpointer.Read()
-
 	if err != nil {
 		return fmt.Errorf("cannot read LSN: %w", err)
 	}
