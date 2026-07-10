@@ -126,6 +126,7 @@ func (c *Consumer) run(ctx context.Context) error {
 	// // change arrives.
 	// relations := map[uint32]*pglogrepl.RelationMessage{}
 	txBuffer := make([]*event.ChangeEvent, 0)
+	inTx := false
 	// main loop
 	for {
 		if time.Now().After(nextHeartbeat) {
@@ -169,6 +170,10 @@ func (c *Consumer) run(ctx context.Context) error {
 				return fmt.Errorf("ParsePrimaryKeepaliveMessage failed: %w", err)
 			}
 
+			if !inTx && pkm.ServerWALEnd > lsn {
+				lsn = pkm.ServerWALEnd
+			}
+
 			if pkm.ReplyRequested {
 				err = pglogrepl.SendStandbyStatusUpdate(
 					ctx,
@@ -205,6 +210,7 @@ func (c *Consumer) run(ctx context.Context) error {
 			// event := c.decodeToEvent(logicalMsg, pendingLSN)
 			switch mgt := logicalMsg.(type) {
 			case *pglogrepl.BeginMessage:
+				inTx = true
 				txBuffer = txBuffer[:0]
 			case *pglogrepl.RelationMessage:
 				c.relations[mgt.RelationID] = mgt
@@ -224,6 +230,7 @@ func (c *Consumer) run(ctx context.Context) error {
 					return fmt.Errorf("checkpoint write failed: %w", err)
 				}
 				lsn = commitLSN
+				inTx = false
 			}
 		}
 	}
