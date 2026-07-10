@@ -124,9 +124,6 @@ func (c *Consumer) run(ctx context.Context) error {
 	// we need to send a heartbeat to ensure postgres doesn't disconect us
 	nextHeartbeat := time.Now().Add(5 * time.Second)
 
-	// // The relation cache - Postgres sends column definitions separately
-	// // from row changes. We store them here and look them up when a row
-	// // change arrives.
 	// relations := map[uint32]*pglogrepl.RelationMessage{}
 	txBuffer := make([]*event.ChangeEvent, 0)
 	inTx := false
@@ -217,6 +214,16 @@ func (c *Consumer) run(ctx context.Context) error {
 				txBuffer = txBuffer[:0]
 			case *pglogrepl.RelationMessage:
 				c.relations[mgt.RelationID] = mgt
+				if mgt.ReplicaIdentity == 'n' {
+					log.Printf("Warning: table %s.%s has REPLICA IDENTITY NOTHING — "+
+						"DELETEs and UPDATE before-images will be empty; sink cannot identify rows",
+						mgt.Namespace, mgt.RelationName)
+				} else if mgt.ReplicaIdentity == 'd' {
+					log.Printf("Note: table %s.%s uses REPLICA IDENTITY DEFAULT — "+
+						"UPDATE/DELETE carry key columns only, not full before-images. "+
+						"Use REPLICA IDENTITY FULL for complete before-images",
+						mgt.Namespace, mgt.RelationName)
+				}
 			case *pglogrepl.InsertMessage, *pglogrepl.UpdateMessage, *pglogrepl.DeleteMessage:
 				e := c.decodeToEvent(logicalMsg, pendingLSN)
 				if e != nil {
@@ -293,6 +300,8 @@ func (c *Consumer) decodeToEvent(
 		)
 		if mgt.OldTuple != nil {
 			e.Before = decodeRow(rel, mgt.OldTuple)
+		} else {
+			log.Printf("Warning: DELETE on %s.%s has no row image. Set REPLICA IDENTITY FULL or ensure a primary key exists.", rel.Namespace, rel.RelationName)
 		}
 		return e
 	}
