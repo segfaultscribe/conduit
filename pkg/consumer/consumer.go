@@ -308,8 +308,9 @@ func decodeRow(
 		colName := rel.Columns[i].Name
 		switch col.DataType {
 		case 'n':
-			// null
-			result[colName] = "NULL"
+			// Convention: key present with nil value = SQL NULL.
+			// Key absent = column not included in this tuple
+			result[colName] = nil
 		case 't':
 			// text
 			result[colName] = string(col.Data)
