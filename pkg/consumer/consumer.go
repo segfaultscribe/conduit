@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/segfaultscribe/conduit/pkg/checkpoint"
 	"github.com/segfaultscribe/conduit/pkg/event"
 	"github.com/segfaultscribe/conduit/pkg/sink"
@@ -21,6 +22,8 @@ type Consumer struct {
 	// eventHandler func(ctx context.Context, event *event.ChangeEvent) error
 	sink sink.Sink
 }
+
+var typeMap = pgtype.NewMap()
 
 // constructor
 // func New(
@@ -313,9 +316,35 @@ func decodeRow(
 			result[colName] = nil
 		case 't':
 			// text
-			result[colName] = string(col.Data)
+			dt, ok := typeMap.TypeForOID(uint32(rel.Columns[i].DataType))
+			if !ok {
+				result[colName] = string(col.Data) // unknown OID, fall back to string
+				continue
+			}
+			val, err := dt.Codec.DecodeDatabaseSQLValue(typeMap, uint32(rel.Columns[i].DataType), pgtype.TextFormatCode, col.Data)
+			if err != nil {
+				result[colName] = string(col.Data) // decode failed, fall back
+				continue
+			}
+			result[colName] = val
+		case 'u':
+			continue
+		case 'b':
+			dt, ok := typeMap.TypeForOID(uint32(rel.Columns[i].DataType))
+			if !ok {
+				// unknown OID, fall back to raw bytes
+				result[colName] = append([]byte(nil), col.Data...)
+				continue
+			}
+			val, err := dt.Codec.DecodeDatabaseSQLValue(typeMap, uint32(rel.Columns[i].DataType), pgtype.BinaryFormatCode, col.Data)
+			if err != nil {
+				result[colName] = append([]byte(nil), col.Data...)
+				continue
+			}
+			result[colName] = val
 		default:
-			result[colName] = "(binary)"
+			log.Printf("Warning: unknown column data type %c for column %s", col.DataType, colName)
+			result[colName] = append([]byte(nil), col.Data...)
 		}
 	}
 	return result
