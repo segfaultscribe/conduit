@@ -61,6 +61,18 @@ func New(
 // start method reconnection loop
 
 func (c *Consumer) Start(ctx context.Context) error {
+	// Facilitates FAIL FAST.
+	// Should not run a pipeline with no working destination.
+	if err := c.sink.Connect(ctx); err != nil {
+		return fmt.Errorf("failed to connect to SINK: %w", err)
+	}
+
+	defer func() {
+		if err := c.sink.Close(); err != nil {
+			log.Printf("sink close error: %v", err)
+		}
+	}()
+
 	for {
 		err := c.run(ctx)
 		// When run returns because the context
@@ -91,10 +103,6 @@ func (c *Consumer) run(ctx context.Context) error {
 	}
 
 	defer conn.Close(ctx)
-
-	if err := c.sink.Connect(ctx); err != nil {
-		return fmt.Errorf("failed to connect to SINK: %w", err)
-	}
 
 	pluginArgs := []string{
 		"proto_version '1'",
