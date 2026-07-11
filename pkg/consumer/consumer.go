@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/segfaultscribe/conduit/pkg/checkpoint"
 	"github.com/segfaultscribe/conduit/pkg/event"
 	"github.com/segfaultscribe/conduit/pkg/sink"
@@ -21,6 +22,8 @@ type Consumer struct {
 	// eventHandler func(ctx context.Context, event *event.ChangeEvent) error
 	sink sink.Sink
 }
+
+var typeMap = pgtype.NewMap()
 
 // constructor
 // func New(
@@ -58,6 +61,18 @@ func New(
 // start method reconnection loop
 
 func (c *Consumer) Start(ctx context.Context) error {
+	// Facilitates FAIL FAST.
+	// Should not run a pipeline with no working destination.
+	if err := c.sink.Connect(ctx); err != nil {
+		return fmt.Errorf("failed to connect to SINK: %w", err)
+	}
+
+	defer func() {
+		if err := c.sink.Close(); err != nil {
+			log.Printf("sink close error: %v", err)
+		}
+	}()
+
 	for {
 		err := c.run(ctx)
 		// When run returns because the context
@@ -89,10 +104,6 @@ func (c *Consumer) run(ctx context.Context) error {
 
 	defer conn.Close(ctx)
 
-	if err := c.sink.Connect(ctx); err != nil {
-		return fmt.Errorf("failed to connect to SINK: %w", err)
-	}
-
 	pluginArgs := []string{
 		"proto_version '1'",
 		"publication_names 'conduit_pub'",
@@ -121,11 +132,9 @@ func (c *Consumer) run(ctx context.Context) error {
 	// we need to send a heartbeat to ensure postgres doesn't disconect us
 	nextHeartbeat := time.Now().Add(5 * time.Second)
 
-	// // The relation cache - Postgres sends column definitions separately
-	// // from row changes. We store them here and look them up when a row
-	// // change arrives.
 	// relations := map[uint32]*pglogrepl.RelationMessage{}
 	txBuffer := make([]*event.ChangeEvent, 0)
+	inTx := false
 	// main loop
 	for {
 		if time.Now().After(nextHeartbeat) {
@@ -169,6 +178,10 @@ func (c *Consumer) run(ctx context.Context) error {
 				return fmt.Errorf("ParsePrimaryKeepaliveMessage failed: %w", err)
 			}
 
+			if !inTx && pkm.ServerWALEnd > lsn {
+				lsn = pkm.ServerWALEnd
+			}
+
 			if pkm.ReplyRequested {
 				err = pglogrepl.SendStandbyStatusUpdate(
 					ctx,
@@ -205,9 +218,20 @@ func (c *Consumer) run(ctx context.Context) error {
 			// event := c.decodeToEvent(logicalMsg, pendingLSN)
 			switch mgt := logicalMsg.(type) {
 			case *pglogrepl.BeginMessage:
+				inTx = true
 				txBuffer = txBuffer[:0]
 			case *pglogrepl.RelationMessage:
 				c.relations[mgt.RelationID] = mgt
+				if mgt.ReplicaIdentity == 'n' {
+					log.Printf("Warning: table %s.%s has REPLICA IDENTITY NOTHING — "+
+						"DELETEs and UPDATE before-images will be empty; sink cannot identify rows",
+						mgt.Namespace, mgt.RelationName)
+				} else if mgt.ReplicaIdentity == 'd' {
+					log.Printf("Note: table %s.%s uses REPLICA IDENTITY DEFAULT — "+
+						"UPDATE/DELETE carry key columns only, not full before-images. "+
+						"Use REPLICA IDENTITY FULL for complete before-images",
+						mgt.Namespace, mgt.RelationName)
+				}
 			case *pglogrepl.InsertMessage, *pglogrepl.UpdateMessage, *pglogrepl.DeleteMessage:
 				e := c.decodeToEvent(logicalMsg, pendingLSN)
 				if e != nil {
@@ -224,6 +248,7 @@ func (c *Consumer) run(ctx context.Context) error {
 					return fmt.Errorf("checkpoint write failed: %w", err)
 				}
 				lsn = commitLSN
+				inTx = false
 			}
 		}
 	}
@@ -283,6 +308,8 @@ func (c *Consumer) decodeToEvent(
 		)
 		if mgt.OldTuple != nil {
 			e.Before = decodeRow(rel, mgt.OldTuple)
+		} else {
+			log.Printf("Warning: DELETE on %s.%s has no row image. Set REPLICA IDENTITY FULL or ensure a primary key exists.", rel.Namespace, rel.RelationName)
 		}
 		return e
 	}
@@ -301,13 +328,40 @@ func decodeRow(
 		colName := rel.Columns[i].Name
 		switch col.DataType {
 		case 'n':
-			// null
-			result[colName] = "NULL"
+			// Convention: key present with nil value = SQL NULL.
+			// Key absent = column not included in this tuple
+			result[colName] = nil
 		case 't':
 			// text
-			result[colName] = string(col.Data)
+			dt, ok := typeMap.TypeForOID(uint32(rel.Columns[i].DataType))
+			if !ok {
+				result[colName] = string(col.Data) // unknown OID, fall back to string
+				continue
+			}
+			val, err := dt.Codec.DecodeDatabaseSQLValue(typeMap, uint32(rel.Columns[i].DataType), pgtype.TextFormatCode, col.Data)
+			if err != nil {
+				result[colName] = string(col.Data) // decode failed, fall back
+				continue
+			}
+			result[colName] = val
+		case 'u':
+			continue
+		case 'b':
+			dt, ok := typeMap.TypeForOID(uint32(rel.Columns[i].DataType))
+			if !ok {
+				// unknown OID, fall back to raw bytes
+				result[colName] = append([]byte(nil), col.Data...)
+				continue
+			}
+			val, err := dt.Codec.DecodeDatabaseSQLValue(typeMap, uint32(rel.Columns[i].DataType), pgtype.BinaryFormatCode, col.Data)
+			if err != nil {
+				result[colName] = append([]byte(nil), col.Data...)
+				continue
+			}
+			result[colName] = val
 		default:
-			result[colName] = "(binary)"
+			log.Printf("Warning: unknown column data type %c for column %s", col.DataType, colName)
+			result[colName] = append([]byte(nil), col.Data...)
 		}
 	}
 	return result

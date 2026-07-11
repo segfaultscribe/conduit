@@ -61,6 +61,7 @@ func (c *Checkpointer) Write(lsn pglogrepl.LSN) error {
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
+	defer os.Remove(f.Name())
 
 	err = binary.Write(f, binary.BigEndian, uint64(lsn))
 	if err != nil {
@@ -68,11 +69,25 @@ func (c *Checkpointer) Write(lsn pglogrepl.LSN) error {
 	}
 
 	// Do not try to rename an open file
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("failed to fsync temp file: %w", err)
+	}
+
 	f.Close()
 
 	err = os.Rename(f.Name(), c.filePath)
 	if err != nil {
 		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+
+	dir, err := os.Open(filepath.Dir(c.filePath))
+	if err != nil {
+		return fmt.Errorf("failed to open checkpoint directory: %w", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("failed to fsync checkpoint directory: %w", err)
 	}
 	return nil
 }
